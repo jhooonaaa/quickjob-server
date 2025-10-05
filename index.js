@@ -80,14 +80,15 @@ app.post(
   upload.fields([{ name: "idPhoto" }, { name: "selfie" }]),
   async (req, res) => {
     try {
+      const { name, email, password, profession } = req.body; // 👈 ADD THIS LINE
+
       const idPhoto = req.files["idPhoto"]
-  ? `/uploads/${req.files["idPhoto"][0].filename}`
-  : null;
+        ? `/uploads/${req.files["idPhoto"][0].filename}`
+        : null;
 
-const selfie = req.files["selfie"]
-  ? `/uploads/${req.files["selfie"][0].filename}`
-  : null;
-
+      const selfie = req.files["selfie"]
+        ? `/uploads/${req.files["selfie"][0].filename}`
+        : null;
 
       const code = Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -97,9 +98,11 @@ const selfie = req.files["selfie"]
         [name, email, password, profession, idPhoto, selfie, code]
       );
 
-      
-
-      res.json({ success: true, message: "Professional registered. Please log in to verify your account." });
+      res.json({
+        success: true,
+        message:
+          "Professional registered. Please log in to verify your account.",
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ success: false, message: "Signup failed" });
