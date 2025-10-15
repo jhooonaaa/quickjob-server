@@ -58,20 +58,25 @@ app.post("/signup-client", upload.single("idPhoto"), async (req, res) => {
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
 
+    // 🔒 Hash the password before saving
+    const hashedPassword = await bcrypt.hash(password, 10);
+
     await db.query(
       `INSERT INTO users (name, email, password, contact, id_photo, role, verification_code, is_verified)
        VALUES ($1,$2,$3,$4,$5,'client',$6,false)`,
-      [name, email, password, contact, idPhoto, code]
+      [name, email, hashedPassword, contact, idPhoto, code]
     );
 
-   
-
-    res.json({ success: true, message: "Client registered. Please log in to verify your account." });
+    res.json({
+      success: true,
+      message: "Client registered. Please log in to verify your account.",
+    });
   } catch (err) {
-    console.error(err);
+    console.error("Signup client error:", err);
     res.status(500).json({ success: false, message: "Signup failed" });
   }
 });
+
 
 
 // ---------------- Signup Professional ----------------
@@ -80,7 +85,7 @@ app.post(
   upload.fields([{ name: "idPhoto" }, { name: "selfie" }]),
   async (req, res) => {
     try {
-      const { name, email, password, profession } = req.body; // 👈 ADD THIS LINE
+      const { name, email, password, profession } = req.body;
 
       const idPhoto = req.files["idPhoto"]
         ? `/uploads/${req.files["idPhoto"][0].filename}`
@@ -92,10 +97,13 @@ app.post(
 
       const code = Math.floor(100000 + Math.random() * 900000).toString();
 
+      // 🔒 Hash the password before saving
+      const hashedPassword = await bcrypt.hash(password, 10);
+
       await db.query(
         `INSERT INTO users (name, email, password, profession, id_photo, selfie, role, verification_code, is_verified)
          VALUES ($1,$2,$3,$4,$5,$6,'professional',$7,false)`,
-        [name, email, password, profession, idPhoto, selfie, code]
+        [name, email, hashedPassword, profession, idPhoto, selfie, code]
       );
 
       res.json({
@@ -104,11 +112,12 @@ app.post(
           "Professional registered. Please log in to verify your account.",
       });
     } catch (err) {
-      console.error(err);
+      console.error("Signup professional error:", err);
       res.status(500).json({ success: false, message: "Signup failed" });
     }
   }
 );
+
 
 
 // ---------------- Verify ----------------
@@ -151,9 +160,10 @@ app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    // 🔹 First, get the user by email only
     const result = await db.query(
-      "SELECT id, role, is_verified, name FROM users WHERE email=$1 AND password=$2",
-      [email, password]
+      "SELECT id, role, is_verified, name, password FROM users WHERE email=$1",
+      [email]
     );
 
     if (result.rows.length === 0) {
@@ -162,6 +172,24 @@ app.post("/login", async (req, res) => {
 
     const user = result.rows[0];
 
+    // 🔹 Compare entered password with hashed password in DB
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.json({ success: false, message: "Invalid credentials" });
+    }
+
+    // ✅ If user is ADMIN — skip verification
+    if (user.role === "admin") {
+      return res.json({
+        success: true,
+        id: user.id,
+        role: user.role,
+        email,
+        name: user.name,
+      });
+    }
+
+    // ✅ For others, check if verified
     if (!user.is_verified) {
       const code = Math.floor(100000 + Math.random() * 900000).toString();
       await db.query(
@@ -175,17 +203,17 @@ app.post("/login", async (req, res) => {
         success: false,
         needsVerification: true,
         message: "A verification code was sent to your email.",
+        role: user.role,
       });
     }
 
-    // ✅ return full user info
+    // ✅ Verified user
     res.json({
       success: true,
-       id: user.id,   
+      id: user.id,
       role: user.role,
       email,
-      name: user.name, 
-      
+      name: user.name,
     });
   } catch (err) {
     console.error(err);
@@ -752,6 +780,37 @@ app.post("/notifications/add", async (req, res) => {
   }
 });
 
+app.put("/requests/complete/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query("UPDATE requests SET status = 'completed' WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Mark as completed error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ✅ Add rating / feedback
+app.post("/ratings/add", async (req, res) => {
+  try {
+    const { request_id, professional_id, client_id, stars, comment } = req.body;
+
+    await db.query(
+      `INSERT INTO ratings (request_id, professional_id, client_id, stars, comment)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [request_id, professional_id, client_id, stars, comment]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Add rating error:", err);
+    res.status(500).json({ success: false, error: "Failed to submit feedback" });
+  }
+});
+
+
+
 // NOT TOTALLY WORK
 
 // 1️⃣ Fetch all client requests for a professional
@@ -779,7 +838,8 @@ app.get("/requests/:professionalId", async (req, res) => {
   }
 });
 
-// 2️⃣ Update request status
+
+// 2️⃣ Update request status and send notification
 app.post("/requests/update", async (req, res) => {
   try {
     const { requestId, status } = req.body;
@@ -789,10 +849,38 @@ app.post("/requests/update", async (req, res) => {
       return res.status(400).json({ success: false, error: "Invalid status" });
     }
 
-    await db.query(
-      `UPDATE requests SET status = $1 WHERE id = $2`,
+    // Update the request status
+    const result = await db.query(
+      `UPDATE requests SET status = $1 WHERE id = $2 RETURNING client_id, professional_id`,
       [status, requestId]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Request not found" });
+    }
+
+    const { client_id, professional_id } = result.rows[0];
+
+    // 🔔 Prepare notification message based on status
+    let message = "";
+    let targetTab = "bookings";
+
+    if (status === "confirmed") {
+      message = "Your booking request has been confirmed!";
+    } else if (status === "declined") {
+      message = "Your booking request has been declined.";
+    } else if (status === "completed") {
+      message = "Your booking has been marked as completed. Please leave feedback!";
+    }
+
+    // 🔔 Send notification only if there's a message
+    if (message) {
+      await db.query(
+        `INSERT INTO notifications (user_id, message, target_tab)
+         VALUES ($1, $2, $3)`,
+        [client_id, message, targetTab]
+      );
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -800,6 +888,7 @@ app.post("/requests/update", async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to update request" });
   }
 });
+
 
 
 // Fetch ratings for a professional
@@ -821,25 +910,7 @@ app.get("/ratings/:professionalId", async (req, res) => {
   }
 });
 
-// Add new rating (client -> professional)
-app.post("/ratings/add", async (req, res) => {
-  const { professionalId, clientId, stars, comment } = req.body;
-  try {
-    await db.query(
-      `INSERT INTO ratings (professional_id, client_id, stars, comment)
-       VALUES ($1, $2, $3, $4)`,
-      [professionalId, clientId, stars, comment]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to add rating" });
-  }
-});
 
-
-
- 
 app.get("/messages/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1037,6 +1108,312 @@ app.post("/payments/release/:transactionId", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+
+
+
+//CLIENT BACKEND
+
+// ✅ GET full professional profile for client viewing
+app.get("/api/professionals/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // ✅ Fetch user and profile
+    const userQuery = await db.query(
+      `
+      SELECT 
+        u.id, u.name, u.email, u.role,
+        p.bio, p.address, p.home, p.contact,
+        p.social_links, p.profile_picture, p.cover_photo
+      FROM users u
+      LEFT JOIN profiles p ON u.id = p.user_id
+      WHERE u.id = $1
+      `,
+      [id]
+    );
+
+    if (userQuery.rows.length === 0) {
+      console.warn("❌ No professional found for ID:", id);
+      return res.status(404).json({ error: "Professional not found" });
+    }
+
+    const profile = userQuery.rows[0];
+
+    if (profile.role !== "professional") {
+      console.warn("⚠️ User is not a professional:", id);
+      return res.status(403).json({ error: "Not a professional" });
+    }
+
+    // ✅ Fetch related data in parallel
+    const [servicesQuery, credentialsQuery, ratingsQuery] = await Promise.all([
+      db.query(`SELECT id, name, description, rate FROM services WHERE user_id = $1`, [id]),
+      db.query(`SELECT id, name, file_path FROM credentials WHERE user_id = $1`, [id]),
+      db.query(
+        `
+        SELECT 
+          r.stars, 
+          r.comment, 
+          r.created_at,
+          u.name AS client_name
+        FROM ratings r
+        LEFT JOIN users u ON r.client_id = u.id
+        WHERE r.professional_id = $1
+        ORDER BY r.created_at DESC
+        `,
+        [id]
+      ),
+    ]);
+
+    // ✅ Build URLs for files
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    if (profile.profile_picture)
+      profile.profile_picture = `${baseUrl}${profile.profile_picture}`;
+    if (profile.cover_photo)
+      profile.cover_photo = `${baseUrl}${profile.cover_photo}`;
+
+    const credentials = credentialsQuery.rows.map((c) => ({
+      ...c,
+      file_path: c.file_path ? `${baseUrl}${c.file_path}` : null,
+    }));
+
+    // ✅ Return the combined profile data
+    res.json({
+      profile,
+      services: servicesQuery.rows || [],
+      credentials,
+      ratings: ratingsQuery.rows || [],
+    });
+  } catch (err) {
+    console.error("🔥 Error fetching professional profile:", err.message);
+    res.status(500).json({ error: "Failed to fetch professional profile" });
+  }
+});
+
+// ✅ Search & list professionals
+app.get("/api/professionals", async (req, res) => {
+  try {
+    const search = req.query.q ? `%${req.query.q}%` : "%";
+
+    // Fetch professionals with joined profile info
+    const result = await db.query(
+      `
+      SELECT 
+        u.id,
+        u.name,
+        u.email,
+        p.bio,
+        p.address,
+        p.profile_picture,
+        p.cover_photo
+      FROM users u
+      LEFT JOIN profiles p ON u.id = p.user_id
+      WHERE u.role = 'professional'
+        AND (u.name ILIKE $1 OR p.bio ILIKE $1 OR p.address ILIKE $1)
+      ORDER BY u.name ASC
+      `,
+      [search]
+    );
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+
+    // Normalize image URLs
+    const professionals = result.rows.map((p) => ({
+      ...p,
+      profile_picture: p.profile_picture
+        ? `${baseUrl}${p.profile_picture}`
+        : null,
+      cover_photo: p.cover_photo ? `${baseUrl}${p.cover_photo}` : null,
+    }));
+
+    res.json(professionals);
+  } catch (err) {
+    console.error("Fetch professionals error:", err);
+    res.status(500).json({ error: "Failed to fetch professionals" });
+  }
+});
+
+app.post("/requests/create", async (req, res) => {
+  try {
+    const {
+      client_id,
+      professional_id,
+      service,
+      date,
+      time,
+      urgency,
+      message,
+      status,
+    } = req.body;
+
+    // 1️⃣ Save the request
+    await db.query(
+      `INSERT INTO requests (client_id, professional_id, service, date, time, urgency, message, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        client_id,
+        professional_id,
+        service,
+        date,
+        time,
+        urgency || "normal",
+        message || "",
+        status || "pending",
+      ]
+    );
+
+    // 2️⃣ Get the client's name (for personalized message)
+    const clientResult = await db.query(
+      `SELECT name FROM users WHERE id = $1`,
+      [client_id]
+    );
+    const clientName = clientResult.rows[0]?.name || "A client";
+
+    // 3️⃣ Insert a notification for the professional
+    await db.query(
+      `INSERT INTO notifications (user_id, message, target_tab)
+       VALUES ($1, $2, $3)`,
+      [
+        professional_id,
+        `${clientName} sent you a new booking request for ${service}.`,
+        "requests",
+      ]
+    );
+
+    // 4️⃣ Respond success
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error creating request:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+
+// ✅ Get all requests made by a specific client
+app.get("/requests/client/:id", async (req, res) => {
+  try {
+    const clientId = req.params.id;
+
+    const result = await db.query(
+      `SELECT r.*, 
+              u.name AS professional_name, 
+              u.email AS professional_email
+       FROM requests r
+       JOIN users u ON r.professional_id = u.id
+       WHERE r.client_id = $1
+       ORDER BY r.created_at DESC`,
+      [clientId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching client requests:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ✅ Get all booking requests made by a client
+app.get("/requests/client/:clientId", async (req, res) => {
+  try {
+    const { clientId } = req.params;
+
+    const result = await db.query(
+      `
+      SELECT r.id, r.service, r.date, r.time, r.urgency, r.message, 
+             r.status, r.created_at, 
+             u.id AS professional_id, u.name AS professional_name
+      FROM requests r
+      JOIN users u ON r.professional_id = u.id
+      WHERE r.client_id = $1
+      ORDER BY r.created_at DESC
+      `,
+      [clientId]
+    );
+
+    res.json({ success: true, requests: result.rows });
+  } catch (err) {
+    console.error("Fetch client requests error:", err);
+    res.status(500).json({ success: false, error: "Failed to fetch client requests" });
+  }
+});
+
+
+// ✅ Fetch saved professionals with profile data and proper URLs
+app.get("/saved-professionals/:clientId", async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+
+    const result = await db.query(
+      `
+      SELECT 
+        u.id, 
+        u.name, 
+        p.profile_picture, 
+        p.address, 
+        p.bio,
+        COALESCE(ROUND(AVG(r.stars), 1), 0) AS avg_rating,
+        COUNT(r.id) AS review_count
+      FROM saved_professionals s
+      JOIN users u ON u.id = s.professional_id
+      LEFT JOIN profiles p ON p.user_id = u.id
+      LEFT JOIN ratings r ON r.professional_id = u.id
+      WHERE s.client_id = $1
+      GROUP BY u.id, u.name, p.profile_picture, p.address, p.bio
+      ORDER BY u.name ASC
+      `,
+      [clientId]
+    );
+
+    // ✅ Add full image URL
+    const professionals = result.rows.map((pro) => ({
+      ...pro,
+      profile_picture: pro.profile_picture
+        ? `${baseUrl}${pro.profile_picture}`
+        : null,
+    }));
+
+    res.json(professionals);
+  } catch (err) {
+    console.error("Fetch saved professionals error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+
+// ✅ Remove saved professional
+app.delete("/saved-professionals/remove", async (req, res) => {
+  try {
+    const { clientId, professionalId } = req.body;
+    await db.query(
+      `DELETE FROM saved_professionals 
+       WHERE client_id = $1 AND professional_id = $2`,
+      [clientId, professionalId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Remove saved professional error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// Add to saved list
+app.post("/saved-professionals/add", async (req, res) => {
+  try {
+    const { clientId, professionalId } = req.body;
+    await db.query(
+      `INSERT INTO saved_professionals (client_id, professional_id)
+       VALUES ($1, $2)
+       ON CONFLICT (client_id, professional_id) DO NOTHING`,
+      [clientId, professionalId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Add saved professional error:", err);
+    res.status(500).json({ error: "Failed to save professional" });
+  }
+});
+
 
 //ADMIN BACKEND
 
