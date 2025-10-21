@@ -48,7 +48,7 @@ async function sendVerificationEmail(email, code) {
     subject: "Verify your QuickJob account",
     text: `Your verification code is: ${code}`,
   });
-}
+} 
 
 // ---------------- Signup Client ----------------
 app.post("/signup-client", upload.single("idPhoto"), async (req, res) => {
@@ -189,7 +189,7 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    // ✅ For others, check if verified
+   // ✅ For others, check if verified
     if (!user.is_verified) {
       const code = Math.floor(100000 + Math.random() * 900000).toString();
       await db.query(
@@ -206,6 +206,7 @@ app.post("/login", async (req, res) => {
         role: user.role,
       });
     }
+
 
     // ✅ Verified user
     res.json({
@@ -809,20 +810,71 @@ app.post("/ratings/add", async (req, res) => {
   }
 });
 
+// ✅ GET full client profile for professional viewing
+app.get("/api/clients/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 🔹 Get user basic info and profile
+    const query = await db.query(
+      `
+      SELECT 
+        u.id, 
+        u.name, 
+        u.email, 
+        p.bio,
+        p.address,
+        p.home,
+        p.contact,
+        p.social_links,
+        p.profile_picture,
+        p.cover_photo
+      FROM users u
+      LEFT JOIN profiles p ON u.id = p.user_id
+      WHERE u.id = $1
+      `,
+      [id]
+    );
+
+    if (query.rows.length === 0)
+      return res.status(404).json({ error: "Client not found" });
+
+    const profile = query.rows[0];
+
+    // ✅ Prefix file paths to full URLs
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    if (profile.profile_picture)
+      profile.profile_picture = `${baseUrl}${profile.profile_picture}`;
+    if (profile.cover_photo)
+      profile.cover_photo = `${baseUrl}${profile.cover_photo}`;
+
+    res.json(profile);
+  } catch (err) {
+    console.error("Error fetching client profile:", err);
+    res.status(500).json({ error: "Failed to fetch client profile" });
+  }
+});
 
 
-// NOT TOTALLY WORK
 
-// 1️⃣ Fetch all client requests for a professional
+// ✅ Fetch all client requests for a professional (with client_id included)
 app.get("/requests/:professionalId", async (req, res) => {
   try {
     const { professionalId } = req.params;
 
     const result = await db.query(
       `
-      SELECT r.id, r.service, r.date, r.time, r.urgency, r.message, 
-             r.status, r.created_at,
-             u.name AS client
+      SELECT 
+        r.id,
+        r.client_id,           
+        u.name AS client,
+        r.service,
+        r.date,
+        r.time,
+        r.urgency,
+        r.message,
+        r.status,
+        r.created_at
       FROM requests r
       JOIN users u ON r.client_id = u.id
       WHERE r.professional_id = $1
@@ -833,10 +885,11 @@ app.get("/requests/:professionalId", async (req, res) => {
 
     res.json(result.rows);
   } catch (err) {
-    console.error("Fetch requests error:", err);
+    console.error("🔥 Fetch requests error:", err);
     res.status(500).json({ error: "Failed to fetch client requests" });
   }
 });
+
 
 
 // 2️⃣ Update request status and send notification
@@ -911,31 +964,223 @@ app.get("/ratings/:professionalId", async (req, res) => {
 });
 
 
-app.get("/messages/:id", async (req, res) => {
+// ---------------- MESSAGES SYSTEM ----------------
+
+// ✅ Create or restore conversation
+app.post("/conversations", async (req, res) => {
+  const { professional_id, client_id } = req.body;
+
   try {
-    const { id } = req.params;
-    const result = await db.query(
-      "SELECT * FROM messages WHERE sender_id=$1 OR receiver_id=$1 ORDER BY created_at ASC",
-      [id]
+    const existing = await db.query(
+      "SELECT * FROM conversations WHERE professional_id=$1 AND client_id=$2",
+      [professional_id, client_id]
     );
-    res.json(result.rows);
+
+    if (existing.rows.length > 0) {
+  const convo = existing.rows[0];
+
+  // If conversation was deleted for both, restore only when a message is sent
+  if (convo.deleted_for_client && convo.deleted_for_professional) {
+    return res.json({ success: false, message: "Conversation deleted for both sides" });
+  }
+
+  return res.json({ success: true, conversation: convo });
+}
+
+
+    // ✅ If none found, create new conversation
+    const created = await db.query(
+      `INSERT INTO conversations (professional_id, client_id, last_message)
+       VALUES ($1, $2, '') RETURNING *`,
+      [professional_id, client_id]
+    );
+
+    res.json({ success: true, conversation: created.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch messages" });
+    console.error("Create conversation error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
-app.post("/messages/send", async (req, res) => {
+
+
+
+app.get("/messages/:conversation_id/:user_id", async (req, res) => {
+  const { conversation_id, user_id } = req.params;
+
   try {
-    const { from, to, message } = req.body;
-    await db.query(
-      "INSERT INTO messages (sender_id, receiver_id, message) VALUES ($1,$2,$3)",
-      [from, to, message]
+    const convoRes = await db.query("SELECT * FROM conversations WHERE id=$1", [conversation_id]);
+    const convo = convoRes.rows[0];
+    if (!convo) return res.status(404).json({ error: "Conversation not found" });
+
+    let filterQuery = "SELECT * FROM messages WHERE conversation_id=$1";
+    const params = [conversation_id];
+
+    // 🧩 Hide messages created before deletion timestamp
+    if (convo.client_id == user_id && convo.deleted_at_client) {
+      filterQuery += " AND created_at > $2";
+      params.push(convo.deleted_at_client);
+    } else if (convo.professional_id == user_id && convo.deleted_at_professional) {
+      filterQuery += " AND created_at > $2";
+      params.push(convo.deleted_at_professional);
+    }
+
+    filterQuery += " ORDER BY created_at ASC";
+
+    const messages = await db.query(filterQuery, params);
+    res.json(messages.rows);
+  } catch (err) {
+    console.error("Fetch messages error:", err);
+    res.status(500).json({ error: "Failed to load messages" });
+  }
+});
+
+
+
+// ✅ Send a message (with fresh start logic)
+// ✅ Send a message (with side-specific restore)
+app.post("/messages", async (req, res) => {
+  const { conversation_id, sender_id, message } = req.body;
+
+  try {
+    const convoRes = await db.query("SELECT * FROM conversations WHERE id=$1", [conversation_id]);
+    const convo = convoRes.rows[0];
+    if (!convo) return res.status(404).json({ success: false, error: "Conversation not found" });
+
+    // Determine who is sending
+    const isClient = convo.client_id === sender_id;
+    const isProfessional = convo.professional_id === sender_id;
+
+    // 🧩 Only clear messages if *the sender’s side* had deleted
+    if ((isClient && convo.deleted_for_client) || (isProfessional && convo.deleted_for_professional)) {
+      await db.query("DELETE FROM messages WHERE conversation_id = $1", [conversation_id]);
+    }
+
+    // 🩵 Insert new message
+    const result = await db.query(
+      `INSERT INTO messages (conversation_id, sender_id, message)
+       VALUES ($1, $2, $3)
+       RETURNING id, conversation_id, sender_id, message, created_at`,
+      [conversation_id, sender_id, message]
     );
+
+    // 🩵 Restore both flags to active (since the chat is re-opened)
+    await db.query(
+      `UPDATE conversations
+       SET last_message = $1,
+           updated_at = NOW(),
+           deleted_for_client = false,
+           deleted_for_professional = false
+       WHERE id = $2`,
+      [message, conversation_id]
+    );
+
+    res.json({ success: true, message: result.rows[0] });
+  } catch (err) {
+    console.error("Send message error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+
+
+// ✅ Get all conversations (for both client & professional)
+app.get("/conversations/:user_id", async (req, res) => {
+  const { user_id } = req.params;
+
+  try {
+    const convo = await db.query(`
+      SELECT 
+        c.*,
+        u1.name AS client_name,
+        COALESCE(p1.profile_picture, '/default-avatar.png') AS client_avatar,
+        u2.name AS professional_name,
+        COALESCE(p2.profile_picture, '/default-avatar.png') AS professional_avatar
+      FROM conversations c
+      JOIN users u1 ON c.client_id = u1.id
+      LEFT JOIN profiles p1 ON p1.user_id = u1.id
+      JOIN users u2 ON c.professional_id = u2.id
+      LEFT JOIN profiles p2 ON p2.user_id = u2.id
+      WHERE 
+        (c.professional_id = $1 AND (c.deleted_for_professional = false OR c.deleted_for_professional IS NULL))
+        OR 
+        (c.client_id = $1 AND (c.deleted_for_client = false OR c.deleted_for_client IS NULL))
+      ORDER BY c.updated_at DESC
+    `, [user_id]);
+
+    res.json(convo.rows);
+  } catch (err) {
+    console.error("Fetch conversations error:", err);
+    res.status(500).json({ error: "Failed to fetch conversations" });
+  }
+});
+
+
+// ✅ Archive a conversation
+app.put("/conversations/:id/archive", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query("UPDATE conversations SET is_archived = TRUE WHERE id = $1", [id]);
     res.json({ success: true });
   } catch (err) {
+    console.error("Archive conversation error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ✅ Unarchive a conversation
+app.put("/conversations/:id/unarchive", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query("UPDATE conversations SET is_archived = FALSE WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Unarchive conversation error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ✅ Delete conversation for CLIENT
+app.delete("/conversations/:id/client", async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query(`
+      UPDATE conversations 
+      SET deleted_for_client = true, deleted_at_client = NOW()
+      WHERE id = $1
+    `, [id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete (client) error:", err);
     res.status(500).json({ success: false });
   }
 });
+
+
+
+
+// ✅ Delete conversation for PROFESSIONAL
+app.delete("/conversations/:id/professional", async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query(`
+      UPDATE conversations 
+      SET deleted_for_professional = true, deleted_at_professional = NOW()
+      WHERE id = $1
+    `, [id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete (professional) error:", err);
+    res.status(500).json({ success: false });
+  }
+});
+
+
+
+
+
 
 
 app.get("/earnings/:id", async (req, res) => {
@@ -1336,6 +1581,98 @@ app.get("/requests/client/:clientId", async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to fetch client requests" });
   }
 });
+
+// ✅ Get all requests made by a specific client (client dashboard)
+app.get("/requests/client/:id", async (req, res) => {
+  try {
+    const clientId = req.params.id;
+
+    const result = await db.query(
+      `SELECT r.*, 
+              u.name AS professional_name, 
+              u.email AS professional_email
+       FROM requests r
+       JOIN users u ON r.professional_id = u.id
+       WHERE r.client_id = $1
+       ORDER BY r.created_at DESC`,
+      [clientId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching client requests:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+// ✅ Get all requests received by a specific professional (for their dashboard)
+app.get("/requests/professional/:id", async (req, res) => {
+  try {
+    const professionalId = req.params.id;
+
+    const result = await db.query(
+      `SELECT r.*, 
+              c.name AS client, 
+              c.email AS client_email
+       FROM requests r
+       JOIN users c ON r.client_id = c.id
+       WHERE r.professional_id = $1
+       ORDER BY r.created_at DESC`,
+      [professionalId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching professional requests:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+// ✅ Get full client profile (for professional viewing)
+app.get("/clients/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const query = await db.query(
+      `
+      SELECT 
+        u.id, 
+        u.name, 
+        u.email, 
+        p.address,
+        p.home,
+        p.contact,
+        p.social_links,
+        p.profile_picture,
+        p.cover_photo
+      FROM users u
+      LEFT JOIN profiles p ON u.id = p.user_id
+      WHERE u.id = $1
+      `,
+      [id]
+    );
+
+    if (query.rows.length === 0)
+      return res.status(404).json({ error: "Client not found" });
+
+    const profile = query.rows[0];
+
+    // Add full image URLs
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    if (profile.profile_picture)
+      profile.profile_picture = `${baseUrl}${profile.profile_picture}`;
+    if (profile.cover_photo)
+      profile.cover_photo = `${baseUrl}${profile.cover_photo}`;
+
+    res.json(profile);
+  } catch (err) {
+    console.error("Error fetching client profile:", err);
+    res.status(500).json({ error: "Failed to fetch client profile" });
+  }
+});
+
 
 
 // ✅ Fetch saved professionals with profile data and proper URLs
