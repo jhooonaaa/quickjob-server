@@ -1036,27 +1036,27 @@ app.get("/messages/:conversation_id/:user_id", async (req, res) => {
 });
 
 
-
-// ✅ Send a message (with fresh start logic)
-// ✅ Send a message (with side-specific restore)
+/// ✅ Send a message (with side-specific restore + unread tracking)
 app.post("/messages", async (req, res) => {
   const { conversation_id, sender_id, message } = req.body;
 
   try {
+    // 1️⃣ Get the conversation
     const convoRes = await db.query("SELECT * FROM conversations WHERE id=$1", [conversation_id]);
     const convo = convoRes.rows[0];
-    if (!convo) return res.status(404).json({ success: false, error: "Conversation not found" });
+    if (!convo)
+      return res.status(404).json({ success: false, error: "Conversation not found" });
 
-    // Determine who is sending
+    // 2️⃣ Identify sender
     const isClient = convo.client_id === sender_id;
     const isProfessional = convo.professional_id === sender_id;
 
-    // 🧩 Only clear messages if *the sender’s side* had deleted
+    // 3️⃣ If sender deleted before, clear their old messages for a clean start
     if ((isClient && convo.deleted_for_client) || (isProfessional && convo.deleted_for_professional)) {
       await db.query("DELETE FROM messages WHERE conversation_id = $1", [conversation_id]);
     }
 
-    // 🩵 Insert new message
+    // 4️⃣ Insert the new message
     const result = await db.query(
       `INSERT INTO messages (conversation_id, sender_id, message)
        VALUES ($1, $2, $3)
@@ -1064,25 +1064,42 @@ app.post("/messages", async (req, res) => {
       [conversation_id, sender_id, message]
     );
 
-    // 🩵 Restore both flags to active (since the chat is re-opened)
+    // 5️⃣ Update conversation state (restore flags + last message)
     await db.query(
       `UPDATE conversations
-       SET last_message = $1,
-           updated_at = NOW(),
-           deleted_for_client = false,
-           deleted_for_professional = false
+       SET 
+         last_message = $1,
+         updated_at = NOW(),
+         deleted_for_client = false,
+         deleted_for_professional = false
        WHERE id = $2`,
       [message, conversation_id]
     );
 
+    // 6️⃣ Mark the message as unread for the other side
+    if (isClient) {
+      await db.query(
+        `UPDATE conversations
+         SET professional_unread = true, client_unread = false
+         WHERE id = $1`,
+        [conversation_id]
+      );
+    } else if (isProfessional) {
+      await db.query(
+        `UPDATE conversations
+         SET client_unread = true, professional_unread = false
+         WHERE id = $1`,
+        [conversation_id]
+      );
+    }
+
+    // 7️⃣ Return the new message
     res.json({ success: true, message: result.rows[0] });
   } catch (err) {
     console.error("Send message error:", err);
     res.status(500).json({ success: false, error: "Server error" });
   }
 });
-
-
 
 // ✅ Get all conversations (for both client & professional)
 app.get("/conversations/:user_id", async (req, res) => {
@@ -1178,6 +1195,28 @@ app.delete("/conversations/:id/professional", async (req, res) => {
 });
 
 
+app.put("/conversations/:id/mark-read", async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body; // "client" or "professional"
+
+  try {
+    if (role === "client") {
+      await db.query(
+        "UPDATE conversations SET client_unread = false WHERE id = $1",
+        [id]
+      );
+    } else if (role === "professional") {
+      await db.query(
+        "UPDATE conversations SET professional_unread = false WHERE id = $1",
+        [id]
+      );
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Mark read error:", err);
+    res.status(500).json({ success: false });
+  }
+});
 
 
 
