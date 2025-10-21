@@ -4,7 +4,8 @@ import multer from "multer";
 import db from "./db.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import nodemailer from "nodemailer";
+import { sendVerificationEmail } from "./utils/sendEmail.js";
+
 import path from "path"
 import { fileURLToPath } from "url"
 import fs from "fs";
@@ -32,7 +33,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // ---------------- Nodemailer setup ----------------
-const transporter = nodemailer.createTransport({
+/* const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
     user: process.env.EMAIL_USER,       // from .env
@@ -48,7 +49,7 @@ async function sendVerificationEmail(email, code) {
     subject: "Verify your QuickJob account",
     text: `Your verification code is: ${code}`,
   });
-} 
+}  */
 
 // ---------------- Signup Client ----------------
 app.post("/signup-client", upload.single("idPhoto"), async (req, res) => {

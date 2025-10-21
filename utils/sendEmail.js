@@ -1,20 +1,36 @@
-import nodemailer from "nodemailer"; 
-import dotenv from "dotenv"; 
-dotenv.config(); // ✅ ensures .env variables are loaded locally
+import sendgrid from "@sendgrid/mail";
+import dotenv from "dotenv";
+dotenv.config(); // make sure .env is loaded
 
+// Set SendGrid API key
+sendgrid.setApiKey(process.env.SENDGRID_API_KEY);
 
- export const sendVerificationEmail = async (email, code) => { 
-const transporter = nodemailer.createTransport({ 
-  service: "gmail", 
-  auth: { 
-    user: process.env.EMAIL_USER, // ✅ use env variable 
-    pass: process.env.EMAIL_PASSWORD, // ✅ use env variable 
-    }, 
-  }); 
-  
-  await transporter.sendMail({ from: "QuickJob" <${process.env.EMAIL_USER}>,
-  to: email, 
-  subject: "Verify your QuickJob account", 
-  text: Your verification code is: ${code}, 
-}); 
+// Helper function to send verification email
+export const sendVerificationEmail = async (email, code) => {
+  try {
+    await sendgrid.send({
+      to: email,
+      from: {
+        email: "quickjobwebsite@gmail.com", // must match your verified sender in SendGrid
+        name: "QuickJob",
+      },
+      subject: "Verify your QuickJob account",
+      text: `Your verification code is: ${code}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; color: #333;">
+          <h2>QuickJob Verification</h2>
+          <p>Your verification code is:</p>
+          <h3 style="color:#eab308">${code}</h3>
+          <p>Please enter this code to verify your account.</p>
+        </div>
+      `,
+    });
+
+    console.log(`✅ Verification email sent to ${email}`);
+  } catch (error) {
+    console.error("❌ Failed to send email:", error);
+    if (error.response) {
+      console.error(error.response.body);
+    }
+  }
 };
